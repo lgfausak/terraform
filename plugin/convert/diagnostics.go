@@ -145,6 +145,9 @@ func PathToAttributePath(p cty.Path) *proto.AttributePath {
 func AddrToAttributePath(addr string) *proto.AttributePath {
 	parts := strings.Split(addr, ".")
 
+	// TODO: How to differentiate between map keys and attributes in the old dotted syntax?
+	// TODO: Support [] syntax
+
 	ap := &proto.AttributePath{}
 	for _, part := range parts {
 		idx, err := strconv.Atoi(part)
