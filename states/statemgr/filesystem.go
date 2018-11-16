@@ -54,7 +54,6 @@ type Filesystem struct {
 	file          *statefile.File
 	readFile      *statefile.File
 	backupFile    *statefile.File
-	written       bool
 	writtenBackup bool
 }
 
@@ -113,9 +112,6 @@ func (s *Filesystem) State() *states.State {
 	if s.file == nil {
 		return nil
 	}
-	if s.backupPath != "" && s.backupFile == nil {
-		s.backupFile = s.file.DeepCopy()
-	}
 	return s.file.DeepCopy().State
 }
 
@@ -138,24 +134,6 @@ func (s *Filesystem) WriteState(state *states.State) error {
 }
 
 func (s *Filesystem) writeState(state *states.State, meta *SnapshotMeta) error {
-	// We'll try to write our backup first, so we can be sure we've created
-	// it successfully before clobbering the original file it came from.
-	if !s.writtenBackup && s.backupFile != nil && s.backupPath != "" && !statefile.StatesMarshalEqual(state, s.backupFile.State) {
-		log.Printf("[TRACE] statemgr.Filesystem: creating backup snapshot at %s", s.backupPath)
-		bfh, err := os.Create(s.backupPath)
-		if err != nil {
-			return fmt.Errorf("failed to create local state backup file: %s", err)
-		}
-		defer bfh.Close()
-
-		err = statefile.Write(s.backupFile, bfh)
-		if err != nil {
-			return fmt.Errorf("failed to write to local state backup file: %s", err)
-		}
-
-		s.writtenBackup = true
-	}
-
 	if s.stateFileOut == nil {
 		if err := s.createStateFiles(); err != nil {
 			return nil
@@ -163,13 +141,46 @@ func (s *Filesystem) writeState(state *states.State, meta *SnapshotMeta) error {
 	}
 	defer s.stateFileOut.Sync()
 
+	// We'll try to write our backup first, so we can be sure we've created
+	// it successfully before clobbering the original file it came from.
+	if !s.writtenBackup && s.backupFile != nil && s.backupPath != "" {
+		if !statefile.StatesMarshalEqual(state, s.backupFile.State) {
+			log.Printf("[TRACE] statemgr.Filesystem: creating backup snapshot at %s", s.backupPath)
+			bfh, err := os.Create(s.backupPath)
+			if err != nil {
+				return fmt.Errorf("failed to create local state backup file: %s", err)
+			}
+			defer bfh.Close()
+
+			err = statefile.Write(s.backupFile, bfh)
+			if err != nil {
+				return fmt.Errorf("failed to write to local state backup file: %s", err)
+			}
+
+			s.writtenBackup = true
+		} else {
+			log.Print("[TRACE] statemgr.Filesystem: not making a backup, because the new snapshot is identical to the old")
+		}
+	} else {
+		// This branch is all just logging, to help understand why we didn't make a backup.
+		switch {
+		case s.backupPath == "":
+			log.Print("[TRACE] statemgr.Filesystem: state file backups are disabled")
+		case s.writtenBackup:
+			log.Printf("[TRACE] statemgr.Filesystem: have already backed up original %s to %s on a previous write", s.path, s.backupPath)
+		case s.backupFile == nil:
+			log.Printf("[TRACE] statemgr.Filesystem: no original state snapshot to back up")
+		default:
+			log.Printf("[TRACE] statemgr.Filesystem: not creating a backup for an unknown reason")
+		}
+	}
+
 	s.file = s.file.DeepCopy()
 	if s.file == nil {
 		s.file = NewStateFile()
 	}
 	s.file.State = state.DeepCopy()
 
-	log.Print("[TRACE] statemgr.Filesystem: truncating the state file")
 	if _, err := s.stateFileOut.Seek(0, os.SEEK_SET); err != nil {
 		return err
 	}
@@ -202,7 +213,8 @@ func (s *Filesystem) writeState(state *states.State, meta *SnapshotMeta) error {
 		return err
 	}
 
-	s.written = true
+	// Any future reads must come from the file we've now updated
+	s.readPath = s.path
 	return nil
 }
 
@@ -215,27 +227,32 @@ func (s *Filesystem) PersistState() error {
 // RefreshState is an implementation of Refresher.
 func (s *Filesystem) RefreshState() error {
 	defer s.mutex()()
+	return s.refreshState()
+}
 
-	log.Printf("[TRACE] statemgr.Filesystem: reading snapshot from %s", s.path)
-
+func (s *Filesystem) refreshState() error {
 	var f *statefile.File
 	if s.stateFileOut != nil {
+		log.Printf("[TRACE] statemgr.Filesystem: reading snapshot from %s", s.path)
 		_, err := s.stateFileOut.Seek(0, os.SEEK_SET)
 		if err != nil {
 			return err
 		}
 		f, err = statefile.Read(s.stateFileOut)
-		// if there's no state then a nil file is file
-		if err != nil && err != statefile.ErrNoState {
-			return err
+		// if there's no state then a nil file is fine
+		if err != nil {
+			if err != statefile.ErrNoState {
+				return err
+			}
+			log.Printf("[TRACE] statemgr.Filesystem: snapshot file has nil snapshot, but that's okay")
 		}
 	}
 
 	// If this manager has been configured with a separate path for initial
 	// read and we've not written anything yet then we actually need to
 	// read the "readFile" now as well, and use that as our initial file.
-	if !s.written && s.readPath != s.path {
-		log.Printf("[TRACE] statemgr.Filesystem: for initial read, will use snapshot from %s instead", s.readPath)
+	if s.stateFileOut == nil || s.readPath != s.path {
+		log.Printf("[TRACE] statemgr.Filesystem: for initial read, will use snapshot from %s", s.readPath)
 
 		var readFile *statefile.File
 
@@ -255,15 +272,16 @@ func (s *Filesystem) RefreshState() error {
 
 		s.file = readFile
 		s.readFile = s.file.DeepCopy()
-		s.backupFile = f.DeepCopy() // backupFile is always what was initially in the output file
 	} else {
+		log.Printf("[TRACE] statemgr.Filesystem: using snapshot from %s", s.path)
 		s.file = f
 		s.readFile = s.file.DeepCopy()
-		s.backupFile = s.file.DeepCopy()
 	}
 
 	if s.file != nil {
 		log.Printf("[TRACE] statemgr.Filesystem: read snapshot with lineage %q serial %d", s.file.Lineage, s.file.Serial)
+	} else {
+		log.Print("[TRACE] statemgr.Filesystem: read nil snapshot")
 	}
 	return nil
 }
@@ -422,6 +440,20 @@ func (s *Filesystem) createStateFiles() error {
 	}
 
 	s.stateFileOut = f
+
+	// If the file already existed with content then that'll be the content
+	// of our backup file if we write a change later.
+	s.backupFile, err = statefile.Read(s.stateFileOut)
+	if err != nil {
+		if err != statefile.ErrNoState {
+			return err
+		}
+		log.Printf("[TRACE] statemgr.Filesystem: no previously-stored snapshot exists")
+	} else {
+		log.Printf("[TRACE] statemgr.Filesystem: existing snapshot has lineage %q serial %d", s.backupFile.Lineage, s.backupFile.Serial)
+	}
+
+	// Refresh now, to load in the snapshot if the file already existed
 	return nil
 }
 
